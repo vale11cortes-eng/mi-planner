@@ -7,6 +7,9 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore-compat.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
@@ -22,7 +25,23 @@
 <body>
 <div id="root"></div>
 <script type="text/babel" data-presets="react">
-const { useState, useEffect, useMemo, useRef, useCallback } = React;
+const { useState, useEffect, useMemo, useRef, useCallback, useContext } = React;
+
+/* ── FIREBASE ── */
+const firebaseConfig = {
+  apiKey: "AIzaSyDTLcfRckePa-q45D1xV9REu1-bTQjwO5g",
+  authDomain: "mi-planner-84836.firebaseapp.com",
+  projectId: "mi-planner-84836",
+  storageBucket: "mi-planner-84836.firebasestorage.app",
+  messagingSenderId: "307991764337",
+  appId: "1:307991764337:web:53de240dd5fbe86cacead0"
+};
+
+firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+const db = firebase.firestore();
+const AuthContext = React.createContext(null);
+
 
 /* ── CONSTANTS ── */
 const C = {
@@ -76,13 +95,50 @@ const addDays  = (d,n) => { const r=new Date(d); r.setDate(r.getDate()+n); retur
 const sameDay  = (a,b) => fmt(a)===fmt(b);
 const fmtMoney = n => Number(n).toLocaleString("es-CL");
 
-/* ── LOCALSTORAGE HOOK ── */
+/* ── CLOUD PERSISTENCE HOOK ── */
 function usePersist(key, init) {
+  const user = useContext(AuthContext);
+  const initVal = () => (typeof init === "function" ? init() : init);
   const [val, setVal] = useState(() => {
-    try { const s=localStorage.getItem(key); return s ? JSON.parse(s) : (typeof init==="function"?init():init); }
-    catch { return typeof init==="function"?init():init; }
+    try { const s = localStorage.getItem(key); return s ? JSON.parse(s) : initVal(); }
+    catch { return initVal(); }
   });
-  useEffect(() => { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} }, [key, val]);
+  const [cloudReady, setCloudReady] = useState(false);
+  const firstCloudLoad = useRef(true);
+
+  useEffect(() => {
+    if (!user) return;
+    setCloudReady(false);
+    firstCloudLoad.current = true;
+    const ref = db.collection("users").doc(user.uid).collection("planner").doc(key);
+    const unsub = ref.onSnapshot((snap) => {
+      if (snap.exists) {
+        const data = snap.data();
+        setVal(data.value ?? initVal());
+      } else {
+        try {
+          const local = localStorage.getItem(key);
+          setVal(local ? JSON.parse(local) : initVal());
+        } catch { setVal(initVal()); }
+      }
+      setCloudReady(true);
+      firstCloudLoad.current = false;
+    }, (err) => {
+      console.error("Error leyendo Firebase", key, err);
+      setCloudReady(true);
+    });
+    return () => unsub();
+  }, [user?.uid, key]);
+
+  useEffect(() => {
+    try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+    if (!user || !cloudReady || firstCloudLoad.current) return;
+    db.collection("users").doc(user.uid).collection("planner").doc(key).set({
+      value: val,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true }).catch(err => console.error("Error guardando Firebase", key, err));
+  }, [key, val, user?.uid, cloudReady]);
+
   return [val, setVal];
 }
 
@@ -155,7 +211,7 @@ function App() {
   useEffect(()=>{ if(tasks.length||expenses.length) flashSave(); },[tasks,expenses,subs,habits,dayNotes]);
 
   /* ── COMPUTED ── */
-  const todayTasks   = tasks.filter(t=>t.date===todayStr);
+  const todayTasks   = taskAs.filter(t=>t.date===todayStr);
   const scheduledT   = todayTasks.filter(t=>t.hour!==null).sort((a,b)=>a.hour-b.hour);
   const unscheduledT = todayTasks.filter(t=>t.hour===null);
   const doneToday    = todayTasks.filter(t=>t.done).length;
@@ -249,7 +305,8 @@ function App() {
             <h1 style={{margin:"2px 0 0",fontFamily:"'Cormorant Garamond',serif",fontSize:24,fontWeight:600}}>Mi Planner</h1>
           </div>
           <div style={{display:"flex",alignItems:"center",gap:10}}>
-            {saveFlash&&<span style={{fontSize:10,color:C.base,fontWeight:600,opacity:.8}}>✓ guardado</span>}
+            {saveFlash&&<span style={{fontSize:10,color:C.base,fontWeight:600,opacity:.8}}>✓ guardado en nube</span>}
+            <button onClick={()=>auth.signOut()} style={{background:C.soft,border:`1px solid ${C.border}`,borderRadius:8,padding:"5px 9px",fontSize:11,color:C.muted,cursor:"pointer"}}>Salir</button>
             <div style={{textAlign:"right",fontSize:11,color:C.muted}}>
               <div style={{fontSize:18,fontWeight:600,color:C.text}}>{doneToday}/{todayTasks.length}</div>
               hoy
@@ -671,7 +728,44 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+
+function LoginScreen() {
+  const [err, setErr] = useState("");
+  const signIn = async () => {
+    setErr("");
+    try {
+      const provider = new firebase.auth.GoogleAuthProvider();
+      provider.setCustomParameters({ prompt: "select_account" });
+      await auth.signInWithPopup(provider);
+    } catch (e) {
+      console.error(e);
+      setErr("No se pudo iniciar sesión. Si estás en Safari y se bloquea la ventana, prueba permitiendo pop-ups o abre el planner en Chrome.");
+    }
+  };
+  return (
+    <div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",padding:20,color:C.text}}>
+      <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:18,padding:28,maxWidth:420,width:"100%",boxShadow:"0 10px 30px rgba(0,0,0,.04)",textAlign:"center"}}>
+        <div style={{fontSize:32,marginBottom:8}}>✨</div>
+        <h1 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:34,margin:"0 0 6px"}}>Mi Planner</h1>
+        <p style={{fontSize:14,color:C.muted,lineHeight:1.6,margin:"0 0 20px"}}>Inicia sesión con Google para guardar tus tareas, hábitos, notas y finanzas en la nube y verlas en todos tus dispositivos.</p>
+        <button onClick={signIn} style={{background:C.text,color:"#fff",border:"none",borderRadius:10,padding:"12px 18px",fontSize:14,fontWeight:600,cursor:"pointer",width:"100%"}}>Entrar con Google</button>
+        {err && <p style={{fontSize:12,color:C.salud,marginTop:14,lineHeight:1.5}}>{err}</p>}
+        <p style={{fontSize:11,color:C.muted,margin:"16px 0 0"}}>Plan gratis Spark · Datos privados por usuario</p>
+      </div>
+    </div>
+  );
+}
+
+function Root() {
+  const [user, setUser] = useState(null);
+  const [ready, setReady] = useState(false);
+  useEffect(() => auth.onAuthStateChanged(u => { setUser(u); setReady(true); }), []);
+  if (!ready) return <div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"DM Sans",color:C.muted}}>Cargando planner…</div>;
+  if (!user) return <LoginScreen/>;
+  return <AuthContext.Provider value={user}><App/></AuthContext.Provider>;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(Root));
 </script>
 </body>
 </html>
